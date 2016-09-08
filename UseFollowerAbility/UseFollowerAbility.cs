@@ -1,14 +1,17 @@
-﻿using CommonBehaviors.Actions;
+﻿using Buddy.Coroutines;
+using CommonBehaviors.Actions;
 using Styx;
 using Styx.Common;
 using Styx.CommonBot;
 using Styx.CommonBot.Coroutines;
+using Styx.Helpers;
 using Styx.Plugins;
 using Styx.TreeSharp;
 using Styx.WoWInternals;
 using Styx.WoWInternals.WoWObjects;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Text;
@@ -20,13 +23,29 @@ namespace UseFollowerAbility
 {
     public class UseFollowerAbility : HBPlugin
     {
+        public static FaSettings S = new FaSettings();
 
+        private readonly List<Coroutine> _coroutines = new List<Coroutine>();
 
         public override void Pulse()
         {
+            if (!StyxWoW.IsInGame || !StyxWoW.IsInWorld || Me == null || !Me.IsValid || !Me.IsAlive || Me.Mounted)
+                return;
+            if (!Me.Combat)
+                return;
+
             // check the current player and make sure they have the ability before we even try anything
             if (PlayerHasRequiredAbility())
             {
+                // remove any already-finished routines
+                for (int i = _coroutines.Count - 1; i >= 0; i--)
+                {
+                    if (_coroutines[i].IsFinished)
+                        _coroutines.RemoveAt(i);
+                    else
+                        _coroutines[i].Resume();
+                }
+
                 // grab all enemies within 50 yards
                 FindEnemies(Range: 50);
 
@@ -34,14 +53,24 @@ namespace UseFollowerAbility
                 if (PlayerIsMeleeClass())
                 {
                     // we have 3 or more enemies within 8 yards
-                    if (activeEnemies(Me.Location, 8f).Count() >= 3)
+                    if (activeEnemies(Me.Location, 8f).Count() >= S.GeneralMobCount)
                     {
-                        if (CastMeleeAbilities()) { return; }       
+                        _coroutines.Add(new Coroutine(() => CastMeleeAbilities(aoe: true)));
+                        return;
                     }
-                    if (activeEnemies(Me.Location, 8f).Count() >= 1)
+                    _coroutines.Add(new Coroutine(() => CastMeleeAbilities()));
+                    return;
+                }
+                else
+                {
+                    // ranged targets don't need 8 yard radius
+                    if (activeEnemies(Me.Location, 40f).Count() >= S.GeneralMobCount)
                     {
-
+                        _coroutines.Add(new Coroutine(() => CastRangedAbilities(aoe: true)));
+                        return;
                     }
+                    _coroutines.Add(new Coroutine(() => CastRangedAbilities()));
+                    return;
                 }
             }
         }
@@ -56,7 +85,7 @@ namespace UseFollowerAbility
         /// <param name="Spell"></param>
         /// <param name="reqs"></param>
         /// <returns></returns>
-        public bool Cast(int Spell, System.Windows.Media.Color newColor, bool reqs = true)
+        public async Task<bool> Cast(int Spell, Color newColor, bool reqs = true)
         {
 
             if (!CurrentTarget.IsValidCombatUnit())
@@ -73,7 +102,7 @@ namespace UseFollowerAbility
                 return false;
             //lastSpellCast = Spell;
             combatLog("^" + WoWSpell.FromId(Spell).Name, newColor);
-            CommonCoroutines.SleepForLagDuration();
+            await CommonCoroutines.SleepForLagDuration();
             return true;
         }
         public static void combatLog(string Message, System.Windows.Media.Color logColor, params object[] args)
@@ -165,37 +194,240 @@ namespace UseFollowerAbility
 
             return false;
         }
-
+        bool UseBossEliteCheck()
+        {
+            return (S.UseOnlyOnBosses && CurrentTarget.IsBoss) || (S.UseOnlyOnElites && CurrentTarget.Elite) || (!S.UseOnlyOnBosses && !S.UseOnlyOnElites);
+        }
         bool PlayerIsRangedClass()
         {
             return !PlayerIsMeleeClass();
         }
-        bool CastMeleeAbilities()
+        /// <summary>
+        /// These are cast within an 8 yard range since they are melee
+        /// </summary>
+        /// <param name="aoe"></param>
+        /// <returns></returns>
+        async Task<bool> CastMeleeAbilities(bool aoe = false)
         {
-            int SpellToCast = 0;
-            if (Me.Class == WoWClass.DeathKnight)
-            {
-                SpellToCast = MeatHook;
-                return false;
-            }
-            if (Me.Class == WoWClass.DemonHunter) { if (SpellManager.HasSpell(MothersCaress)) { return true; } return false; }
-            if (Me.Class == WoWClass.Rogue) { if (SpellManager.HasSpell(SealOfRavenholdt)) { return true; } return false; }
-            if (Me.Class == WoWClass.Warrior) { if (SpellManager.HasSpell(WindsOfTheNorth) || SpellManager.HasSpell(TitansWrath)) { return true; } return false; }
+            if (Me.Class == WoWClass.DeathKnight) { if (await CastMeatHook(aoe)) { return true; } }
+            if (Me.Class == WoWClass.DemonHunter) { if (await CastMothersCaress(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Rogue) { if (await CastSealOfRavenholdt()) { return true; } }
+            if (Me.Class == WoWClass.Warrior) { if (await CastWindsOfTheNorth(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Warrior) { if (await CastTitansWrath(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Druid) { if (await CastNightmarishVisions()) { return true; } }
+            if (Me.Class == WoWClass.Hunter) { if (await CastEmmarelsAssault(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Paladin) { if (await CastBloodVanguard(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Paladin) { if (await CastJudgementsGaze(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Shaman) { if (await CastBoundlessQuintessence()) { return true; } }
 
-            if (Me.Class == WoWClass.Druid) { if (SpellManager.HasSpell(NightmarishVisions)) { return true; } return false; }
-            if (Me.Class == WoWClass.Hunter) { if (SpellManager.HasSpell(EmmarelsAssault)) { return true; } return false; }
-            if (Me.Class == WoWClass.Paladin) { if (SpellManager.HasSpell(BloodVanguard) || SpellManager.HasSpell(JudgementsGaze)) { return true; } return false; }
-            if (Me.Class == WoWClass.Shaman) { if (SpellManager.HasSpell(BoundlessQuintessence)) { return true; } return false; }
+            return false;
+        }
 
-            if (SpellToCast > 0)
+        async Task<bool> CastRangedAbilities(bool aoe = false)
+        {
+            if (Me.Class == WoWClass.Druid) { if (await CastNightmarishVisions()) { return true; } }
+            if (Me.Class == WoWClass.Hunter) { if (await CastEmmarelsAssault(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Paladin) { if (await CastBloodVanguard(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Paladin) { if (await CastJudgementsGaze(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Shaman) { if (await CastBoundlessQuintessence()) { return true; } }
+            if (Me.Class == WoWClass.Mage) { if (await CastKalecgosFury(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Priest) { if (await CastLightOfTheNaaru(aoe)) { return true; } }
+            if (Me.Class == WoWClass.Warlock) { if (await CastEternalBanishment()) { return true; } }
+            if (Me.Class == WoWClass.Warlock) { if (await CastSixSoulBag()) { return true; } }
+
+            return false;
+        }
+        #region Cast Individual Spells
+        async Task<bool> CastMeatHook(bool aoe)
+        {
+
+            if (aoe || (S.DkMeatHookLowHp && Me.HealthPercent <= S.DkMeatHookHpValue))
             {
-                if (Cast(MeatHook, Colors.Orange))
+                if (await Cast(MeatHook, Colors.Orange))
                 {
                     return true;
                 }
             }
             return false;
         }
+        async Task<bool> CastMothersCaress(bool aoe)
+        {
+
+            if (aoe || UseBossEliteCheck())
+            {
+                if (await Cast(MothersCaress, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        async Task<bool> CastNightmarishVisions()
+        {
+
+            if (UseBossEliteCheck())
+            {
+                if (await Cast(NightmarishVisions, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastEmmarelsAssault(bool aoe)
+        {
+
+            if (aoe || UseBossEliteCheck())
+            {
+                if (await Cast(EmmarelsAssault, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastKalecgosFury(bool aoe)
+        {
+
+            if (aoe || UseBossEliteCheck())
+            {
+                if (await Cast(KalecgosFury, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        async Task<bool> CastBloodVanguard(bool aoe)
+        {
+
+            if (aoe || UseBossEliteCheck())
+            {
+                if (await Cast(BloodVanguard, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastJudgementsGaze(bool aoe)
+        {
+
+            if (aoe || UseBossEliteCheck())
+            {
+                if (await Cast(JudgementsGaze, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastLightOfTheNaaru(bool aoe)
+        {
+
+            if (aoe || S.PriestLightOfTheNaaruLowHp && Me.HealthPercent <= S.PriestLightOfTheNaaruHpValue)
+            {
+                if (await Cast(LightOfTheNaaru, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastSealOfRavenholdt()
+        {
+
+            if (UseBossEliteCheck() && CurrentTarget.HealthPercent >= S.RogueSealOfRavenholdtMinimumHpValue)
+            {
+                if (await Cast(SealOfRavenholdt, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastBoundlessQuintessence()
+        {
+
+            if (Me.HealthPercent <= S.ShamanBoundlessQuintessenceHpValue)
+            {
+                if (await Cast(BoundlessQuintessence, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastEternalBanishment()
+        {
+
+            if (UseBossEliteCheck())
+            {
+                if (await Cast(EternalBanishment, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastEredarTwins()
+        {
+
+            if (UseBossEliteCheck())
+            {
+                if (await Cast(EredarTwins, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastSixSoulBag()
+        {
+
+            if (UseBossEliteCheck())
+            {
+                if (await Cast(SixSoulBag, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastWindsOfTheNorth(bool aoe)
+        {
+
+            if (aoe || UseBossEliteCheck())
+            {
+                if (await Cast(WindsOfTheNorth, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        async Task<bool> CastTitansWrath(bool aoe)
+        {
+
+            if (aoe || UseBossEliteCheck())
+            {
+                if (await Cast(TitansWrath, Colors.Orange))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+
+
+
+
+
+        #endregion
+
         #endregion
 
         #endregion
@@ -235,12 +467,33 @@ namespace UseFollowerAbility
                 return new Version(1, 0);
             }
         }
-        #region Initialize
-        public UseFollowerAbility()
+        private void ClearCoroutines()
         {
-            enemyCount = new List<WoWUnit>();
+            foreach (Coroutine ct in _coroutines)
+                ct.Dispose();
+
+            _coroutines.Clear();
         }
-        #endregion
+
+        private void BotEvents_OnBotStopped(EventArgs args)
+        {
+            ClearCoroutines();
+        }
+        public override void OnEnable()
+        {
+            BotEvents.OnBotStopped += BotEvents_OnBotStopped;
+            enemyCount = new List<WoWUnit>();
+            combatLog("Enabled!", Colors.OrangeRed);
+        }
+        public override void OnDisable()
+        {
+            ClearCoroutines();
+            enemyCount = null;
+            combatLog("Disabled!", Colors.OrangeRed);
+        }
+
+
+
         #endregion
 
         public const int
@@ -312,5 +565,31 @@ namespace UseFollowerAbility
         {
             return !me.GotTarget ? 0f : Math.Max(5f, me.CombatReach + 1.3333334f + Unit.CombatReach);
         }
+    }
+
+    public class FaSettings : Settings
+    {
+        public FaSettings()
+            : base(Path.Combine(SettingsDirectory, "UseFollowerAbility"))
+        { }
+        [Setting, DefaultValue(3)]
+        public int GeneralMobCount { get; set; }
+        [Setting, DefaultValue(false)]
+        public bool UseOnlyOnBosses { get; set; }
+        [Setting, DefaultValue(false)]
+        public bool UseOnlyOnElites { get; set; }
+        [Setting, DefaultValue(true)]
+        public bool DkMeatHookLowHp { get; set; }
+        [Setting, DefaultValue(60)]
+        public int DkMeatHookHpValue { get; set; }
+        [Setting, DefaultValue(true)]
+        public bool PriestLightOfTheNaaruLowHp { get; set; }
+        [Setting, DefaultValue(60)]
+        public int PriestLightOfTheNaaruHpValue { get; set; }
+        [Setting, DefaultValue(90)]
+        public int RogueSealOfRavenholdtMinimumHpValue { get; set; }
+        [Setting, DefaultValue(60)]
+        public int ShamanBoundlessQuintessenceHpValue { get; set; }
+
     }
 }
